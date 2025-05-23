@@ -1,0 +1,42 @@
+ComfyUI/
+├── models/
+│   ├── ipadapter/              # IP适配器模型
+│   │   └── instantcharacter_ip-adapter.bin
+│   │
+│   ├── clip_vision/            # 视觉模型 (DINOv2, SigLIP)
+│   │   ├── dinov2-vitl14.bin   # DINOv2模型
+│   │   └── siglip_so400m.pth   # SigLIP模型
+│   │
+│
+└── custom_nodes/
+    └── PIP_InstantCharacter/    # 本项目
+        ├── nodes/              # 节点实现
+        ├── utils/              # 工具函数
+        └── ...
+
+
+
+
+1. IP适配器模型 (必需)
+位置: ComfyUI/models/ipadapter/
+
+文件:
+
+instantcharacter_ip-adapter.bin (必需)
+其他可选的IP适配器模型 (如果有)
+说明:
+
+这是核心的InstantCharacter IP适配器模型
+通过folder_paths.get_full_path("ipadapter", ip_adapter_name)加载
+默认会查找instantcharacter_ip-adapter.bin文件
+2. 视觉模型 (必需)
+DINOv2 模型
+用途: 提取图像的全局语义特征
+加载方式: 通过ComfyUI的CLIP_VISION输入端口传入
+预期位置: 由ComfyUI自动管理，通常位于ComfyUI/models/clip_vision/
+SigLIP 模型 (可选但推荐)
+用途: 提取图像的细粒度视觉特征
+加载方式: 通过可选的SigLIP输入端口传入
+预期位置: 由ComfyUI自动管理，通常位于ComfyUI/models/clip_vision/
+
+

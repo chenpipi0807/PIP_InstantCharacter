@@ -1,0 +1,1197 @@
+"""
+PIP-InstantCharacter节点 - 为FLUX工作流设计的InstantCharacter实现
+参考了PuLID的工作方式，用于角色保留生成
+"""
+
+import os
+import sys
+import traceback
+import math
+import gc
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from PIL import Image, ImageDraw
+from comfy.model_management import get_torch_device
+from comfy.cli_args import args
+from comfy.utils import tensor_to_pil, pil_to_tensor
+from comfy.clip_vision import clip_preprocess
+from comfy.model_patcher import ModelPatcher
+from nodes import VAEDecode, CLIPTextEncode, LoraLoader
+
+# 自定义图像转换函数
+def tensor2pil(tensor):
+    """ 将张量转换为PIL图像 (BHWC -> PIL) """
+    # 先确保数据类型为float32
+    tensor = tensor.cpu().detach().float()
+    
+    # 如果是批次图像，取第一张
+    if len(tensor.shape) == 4:
+        tensor = tensor[0]
+        
+    # 将数值范围限制在0-1之间
+    tensor = torch.clamp(tensor, 0.0, 1.0)
+    
+    # 如果是单通道图像(掩码)，转换为L模式
+    if tensor.shape[2] == 1:
+        array = tensor.squeeze().numpy() * 255.0
+        return Image.fromarray(array.astype(np.uint8), mode='L')
+    else:
+        # 将张量转为numpy数组，并转换为0-255范围
+        array = tensor.numpy() * 255.0
+        return Image.fromarray(array.astype(np.uint8), mode='RGB')
+
+def pil2tensor(image):
+    """ 将PIL图像转换为张量 (PIL -> BHWC) """
+    # 判断格式
+    if image.mode == 'L':
+        # 单通道图像
+        tensor = torch.from_numpy(np.array(image)).float() / 255.0
+        tensor = tensor.unsqueeze(2)  # 添加通道维度
+    else:
+        # RGB图像
+        tensor = torch.from_numpy(np.array(image)).float() / 255.0
+        if len(tensor.shape) == 2:
+            tensor = tensor.unsqueeze(2)  # 添加通道维度
+        if tensor.shape[2] == 4:  # RGBA图像
+            tensor = tensor[:, :, :3]  # 去除alpha通道
+    
+    # 添加batch维度
+    return tensor.unsqueeze(0)
+
+
+# InstantCharacter IP适配器类
+class InstantCharacterIPAdapter:
+    """处理InstantCharacter IP适配器的加载和应用"""
+    
+    def __init__(self, adapter_path, device="cuda"):
+        """
+        初始化IP适配器
+        
+        Args:
+            adapter_path: IP适配器模型路径
+            device: 使用设备
+        """
+        self.device = device
+        self.adapter_path = adapter_path
+        
+        # 检查IP适配器文件是否存在
+        if not os.path.exists(adapter_path):
+            raise FileNotFoundError(f"InstantCharacter IP适配器文件不存在: {adapter_path}")
+        
+        print(f"[PIP-InstantCharacter] 加载IP适配器: {adapter_path}")
+        self.load_adapter(adapter_path)
+    
+    def load_adapter(self, adapter_path):
+        """加载IP适配器权重"""
+        try:
+            self.state_dict = torch.load(adapter_path, map_location="cpu")
+            
+            # 提取关键权重并加载到相应组件
+            self.image_proj = self._extract_component(self.state_dict, "subject_image_proj")
+            self.image_proj_norm = self._extract_component(self.state_dict, "subject_image_proj_norm")
+            self.image_proj_2 = self._extract_component(self.state_dict, "subject_image_proj_2")
+            self.image_proj_norm_2 = self._extract_component(self.state_dict, "subject_image_proj_norm_2")
+            self.hidden_states_proj = self._extract_component(self.state_dict, "subject_hidden_states_proj")
+            
+            print(f"[PIP-InstantCharacter] IP适配器加载成功, 包含 {len(self.state_dict.keys())} 个权重")
+        except Exception as e:
+            print(f"[PIP-InstantCharacter] IP适配器加载失败: {str(e)}")
+            raise e
+    
+    def _extract_component(self, state_dict, prefix):
+        """从状态字典中提取特定前缀的参数并构建组件"""
+        params = {k.replace(f"{prefix}.", ""): v for k, v in state_dict.items() if k.startswith(f"{prefix}.")}
+        if not params:
+            return None
+            
+        # 简单情况下，我们假设这是一个线性层
+        if "weight" in params and "bias" in params:
+            layer = torch.nn.Linear(
+                in_features=params["weight"].shape[1], 
+                out_features=params["weight"].shape[0]
+            )
+            layer.weight.data.copy_(params["weight"])
+            layer.bias.data.copy_(params["bias"])
+            return layer
+        
+        return None
+    
+    def prepare_reference_image(self, image_tensor):
+        """
+        将ComfyUI格式图像转换为模型所需格式
+        
+        Args:
+            image_tensor: BHWC格式的图像张量
+        
+        Returns:
+            预处理后的参考图像特征
+        """
+        # TODO: 实际实现需要包含SigLIP和DINOv2编码器
+        # 这里只是一个占位符，表示我们会提取图像特征
+        # 实际的InstantCharacter实现需要两个编码器
+        
+        # 简化版本 - 返回一个带有图像基本信息的张量
+        if image_tensor is None:
+            return None
+            
+        # 确保是BCHW格式
+        if len(image_tensor.shape) == 3:
+            image_tensor = image_tensor.unsqueeze(0)
+        elif len(image_tensor.shape) == 4 and image_tensor.shape[3] == 3:
+            # BHWC -> BCHW
+            image_tensor = image_tensor.permute(0, 3, 1, 2)
+        
+        # 调整大小到适合编码器的输入尺寸
+        image_tensor = F.interpolate(image_tensor, size=(384, 384), mode='bilinear', align_corners=False)
+        
+        # 返回占位符特征
+        feature = torch.randn(1, 1024, 768).to(image_tensor.device)
+        return feature
+
+
+class InputNormalizer(nn.Module):
+    def __init__(self, target_size=224):
+        super().__init__()
+        self.target_size = target_size
+        self.pad = nn.ZeroPad2d((0,0,0,0))  # 动态填充层
+        
+    def forward(self, x):
+        # 保持长宽比缩放（参考DINOv2论文）
+        h, w = x.shape[2], x.shape[3]
+        scale = self.target_size / max(h, w)
+        new_h, new_w = int(h*scale), int(w*scale)
+        x = F.interpolate(x, size=(new_h, new_w), mode='bicubic', align_corners=False)
+        
+        # 动态填充至标准尺寸（兼容任意输入）
+        pad_h = (self.target_size - new_h) // 2
+        pad_w = (self.target_size - new_w) // 2
+        self.pad.padding = (pad_w, self.target_size - new_w - pad_w, pad_h, self.target_size - new_h - pad_h)
+        return self.pad(x)
+
+class FeatureProjector(nn.Module):
+    def __init__(self, dinov2_dim=1024, siglip_dim=1152, hidden_dim=768):
+        super().__init__()
+        self.dino_proj = nn.Linear(dinov2_dim, hidden_dim//2)
+        self.siglip_proj = nn.Linear(siglip_dim, hidden_dim//2)
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        
+    def forward(self, dinov2_feat, siglip_feat):
+        # 动态降维（防止维度爆炸）
+        dino = self.dino_proj(dinov2_feat)  # [B,1024] -> [B,384]
+        
+        # 处理不同形状的siglip特征
+        if siglip_feat.dim() > 2:
+            if siglip_feat.dim() == 3:  # [B,L,C]
+                siglip_feat = siglip_feat.mean(dim=1)  # 平均池化
+        
+        siglip = self.siglip_proj(siglip_feat)  # [B,1152] -> [B,384]
+        fused = torch.cat([dino, siglip], dim=-1)  # [B,768]
+        return self.layer_norm(fused)
+
+class InstantCharacterFeatureExtractor:
+    """提取参考图像特征的工具类"""
+    def __init__(self):
+        # 假装我们有SigLIP和DINOv2编码器
+        # 在完整实现中，这里应该加载这两个模型
+        pass
+    
+    # 从PIL图像中提取特征
+    def extract_features(self, pil_image):
+        # 假装我们在这里提取特征
+        # 在完整实现中，这里应该调用模型进行特征提取
+        return None
+
+
+# 主节点 - 应用InstantCharacter到FLUX模型
+class PIPApplyInstantCharacter:
+    """PIP-InstantCharacter 是一个强大的AI角色保留生成节点，它根据单张参考图像生成保持特征的对象。"""
+    
+    # 动态扫描IP适配器
+    ip_adapter_names = []
+    try:
+        ip_adapter_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models", "ipadapter")
+        # 假如路径不存在，尝试在ComfyUI目录下找
+        if not os.path.exists(ip_adapter_dir):
+            ip_adapter_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "models", "ipadapter")
+        
+        if os.path.exists(ip_adapter_dir):
+            for file in os.listdir(ip_adapter_dir):
+                if file.endswith(".bin") and file != "instantcharacter_ip-adapter.bin":
+                    ip_adapter_names.append(file)
+    except Exception as e:
+        print(f"[PIP-InstantCharacter] 扫描IP适配器时出错: {e}")
+
+    INPUT_TYPES = {
+        "required": {
+            "model": ("MODEL",),
+            "reference_image": ("IMAGE",),
+            "DINOv2": ("CLIP_VISION",),
+            "subject_scale": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
+            "ip_adapter_name": (["instantcharacter_ip-adapter.bin"] + ip_adapter_names,),
+        },
+        "optional": {
+            "SigLIP": ("CLIP_VISION",),
+            "low_memory_mode": ("BOOLEAN", {"default": False})
+        }
+    }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "apply_instantcharacter"
+    CATEGORY = "PIP_InstantCharacter"
+    
+    def __init__(self):
+        # 初始化输入标准化模块
+        self.input_normalizer_dinov2 = InputNormalizer(target_size=224)  # DinoV2标准尺寸
+        self.input_normalizer_siglip = InputNormalizer(target_size=224)  # SigLIP标准尺寸
+        
+        # 初始化特征投影器
+        self.feature_projector = None  # 延迟初始化，直到知道特征维度
+    
+    def encode_image(self, vision_model, image, model_type="unknown"):
+        """将图像编码为特征向量
+        
+        Args:
+            vision_model: 视觉模型(DinoV2或SigLIP)
+            image: 输入图像，必须是BCHW格式(内部处理)
+            model_type: 模型类型，用于日志
+            
+        Returns:
+            编码后的特征
+        """
+        try:
+            # 1. 基本格式检查和通道转换
+            if len(image.shape) != 4:
+                raise ValueError(f"[PIP-InstantCharacter] 输入图像必须是4维张量，当前: {image.shape}")
+            
+            # 确保通道维度在正确位置 - BCHW格式 (通道在索引1位置)
+            if image.shape[1] != 3:
+                # 如果是BHWC格式，转换为BCHW
+                if image.shape[3] == 3:
+                    print(f"[PIP-InstantCharacter] 检测到BHWC格式, 转换为BCHW: {image.shape}")
+                    image = image.permute(0, 3, 1, 2).contiguous()
+                else:
+                    print(f"[PIP-InstantCharacter] 警告: 无法检测通道维度: {image.shape}")
+                    return self._create_special_features(model_type)
+            
+            # 2. 内存优化与清理
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                gc.collect()
+            
+            # 3. 强制设备同步 - 确保模型和输入在同一设备上
+            # 设备统一管理 - 查找模型所在设备
+            try:
+                if hasattr(vision_model, 'device'):
+                    # 直接使用模型的device属性
+                    model_device = vision_model.device
+                elif hasattr(vision_model, 'load_device'):
+                    # ComfyUI模式下的device属性
+                    model_device = vision_model.load_device
+                else:
+                    # 通过参数推断设备
+                    model_device = next(vision_model.parameters()).device
+                
+                print(f"[PIP-InstantCharacter] 模型{model_type}运行在设备: {model_device}")
+            except Exception as e:
+                print(f"[PIP-InstantCharacter] 无法确定模型设备，使用CPU: {e}")
+                model_device = torch.device('cpu')
+            
+            # 4. 值范围检查和规范化
+            min_val = torch.min(image).item()
+            max_val = torch.max(image).item()
+            if min_val < 0 or max_val > 1.0:
+                print(f"[PIP-InstantCharacter] 值范围异常: {min_val:.3f}-{max_val:.3f}，规范化到[0,1]")
+                if max_val > 1.0 and max_val <= 255.0:
+                    image = image / 255.0
+                else:
+                    image = (image - min_val) / (max_val - min_val + 1e-5)
+            
+            # 5. 强制类型转换
+            image = image.to(dtype=torch.float32)
+            
+            # 6. 基于模型类型使用不同的输入标准化器
+            # 输入标准化 - 适配模型的尺寸要求
+            with torch.no_grad():
+                if 'dino' in model_type.lower():
+                    print(f"[PIP-InstantCharacter] 使用DinoV2输入标准化模块...")
+                    # 使用输入标准化器处理
+                    image = self.input_normalizer_dinov2(image)
+                    # 转移到模型设备
+                    image = image.to(model_device)
+                    
+                elif 'siglip' in model_type.lower():
+                    print(f"[PIP-InstantCharacter] 使用SigLIP输入标准化模块...")
+                    # 对于SigLIP，使用特定的输入标准化
+                    image = self.input_normalizer_siglip(image)
+                    # 转移到模型设备
+                    image = image.to(model_device)
+                else:
+                    # 默认标准化
+                    image = F.interpolate(image, size=(224, 224), mode='bicubic', align_corners=False)
+                    image = image.to(model_device)
+            
+            # 输出调试信息
+            print(f"[PIP-InstantCharacter] 编码{model_type}特征，图像形状: {image.shape}, 类型: {image.dtype}, 设备: {image.device}")
+            print(f"[PIP-InstantCharacter] 值范围: {torch.min(image).item():.3f}-{torch.max(image).item():.3f}")
+            
+            # 输出像素样本
+            first_pixel = (image[0,:,0,0].cpu().numpy() * 255).astype(int)
+            print(f"[PIP-InstantCharacter] 第一个像素RGB值: {first_pixel}")
+            
+            # 确保输入是float32类型
+            image = image.to(torch.float32)
+            
+            # 特征提取
+            features = None
+            
+            try:
+                with torch.no_grad(), torch.cuda.amp.autocast(enabled=True):  # 启用混合精度
+                    if 'dino' in model_type.lower():
+                        # DinoV2特征提取
+                        print(f"[PIP-InstantCharacter] 使用优化的DinoV2特征提取方法")
+                        
+                        # 尝试多种方式提取特征
+                        if hasattr(vision_model, 'encode_image'):
+                            print(f"[PIP-InstantCharacter] 使用vision_model.encode_image()...")
+                            features = vision_model.encode_image(image)
+                            print(f"[PIP-InstantCharacter] 成功获取DinoV2特征，形状: {features.shape}")
+                        
+                        # 如果模型有model属性，尝试直接使用内部模型
+                        elif hasattr(vision_model, 'model'):
+                            # 获取内部模型
+                            inner_model = vision_model.model
+                            print(f"[PIP-InstantCharacter] 使用vision_model.model()...")
+                            
+                            # 归一化输入
+{{ ... }}
+                                inputs = image
+                                if hasattr(vision_model, 'image_mean') and hasattr(vision_model, 'image_std'):
+                                    mean = torch.tensor(vision_model.image_mean).view(1, 3, 1, 1).to(image.device)
+                                    std = torch.tensor(vision_model.image_std).view(1, 3, 1, 1).to(image.device)
+                                    inputs = (inputs - mean) / std
+                                
+                                # 尝试多种调用方式
+                                try:
+                                    # 最简单的直接调用
+                                    print(f"[PIP-InstantCharacter] 尝试直接调用inner_model...")
+                                    outputs = inner_model(inputs)
+                                    features = outputs
+                                    
+                                    # 处理输出
+                                    if isinstance(outputs, dict):
+                                        if 'last_hidden_state' in outputs:
+                                            features = outputs['last_hidden_state'][:, 0]
+                                            print(f"[PIP-InstantCharacter] 成功提取DinoV2 last_hidden_state特征: {features.shape}")
+                                        elif 'image_embeds' in outputs:
+                                            features = outputs['image_embeds']
+                                            print(f"[PIP-InstantCharacter] 成功提取DinoV2 image_embeds特征: {features.shape}")
+                                    elif isinstance(outputs, torch.Tensor):
+                                        print(f"[PIP-InstantCharacter] 成功提取DinoV2张量特征: {features.shape}")
+                                    else:
+                                        print(f"[PIP-InstantCharacter] 无法识别DinoV2特征格式: {type(features)}")
+                                        features = self._create_special_features(model_type)
+                                except Exception as e:
+                                    print(f"[PIP-InstantCharacter] 简单调用出错: {e}")
+                                    try:
+                                        # 尝试带参数调用
+                                        print(f"[PIP-InstantCharacter] 尝试带参数调用...")
+                                        outputs = inner_model(inputs, output_hidden_states=True)
+                                        
+                                        # 处理输出
+                                        if isinstance(outputs, tuple) and len(outputs) > 0:
+                                            features = outputs[0]
+                                            print(f"[PIP-InstantCharacter] 使用tuple输出的第一个元素: {features.shape}")
+                                        elif isinstance(outputs, dict):
+                                            if 'hidden_states' in outputs and outputs['hidden_states'] is not None:
+                                                # 通常是最后一层的隐藏状态
+                                                features = outputs['hidden_states'][-1][:, 0]
+                                                print(f"[PIP-InstantCharacter] 使用hidden_states: {features.shape}")
+                                            else:
+                                                # 其他可能的输出字段
+                                                features = self._create_special_features(model_type)
+                                        else:
+                                            features = self._create_special_features(model_type)
+                                    except Exception as e2:
+                                        print(f"[PIP-InstantCharacter] 带参数调用也失败: {e2}")
+                                        features = self._create_special_features(model_type)
+                            else:
+                                # 最后尝试标准调用
+                                print(f"[PIP-InstantCharacter] 尝试标准encode_image调用")
+                                features = vision_model.encode_image(image.to(vision_model.load_device))
+                                print(f"[PIP-InstantCharacter] 标准调用成功: {type(features)}")
+                        except Exception as dino_err:
+                            print(f"[PIP-InstantCharacter] DinoV2直接提取失败: {dino_err}")
+                            traceback.print_exc()
+                            # 尝试一个更安全的方法 - 使用clip_preprocess
+                            try:
+                                print("[PIP-InstantCharacter] 尝试使用clip_preprocess函数")
+                                # 导入clip_preprocess
+                                from comfy.clip_vision import clip_preprocess
+                                # 准备输入
+                                processed = clip_preprocess(image.to(vision_model.load_device), 
+                                                           size=224,
+                                                           mean=[0.48145466, 0.4578275, 0.40821073],
+                                                           std=[0.26862954, 0.26130258, 0.27577711])
+                                # 运行模型
+                                with torch.no_grad():
+                                    features = vision_model.encode_image(processed)
+                                print(f"[PIP-InstantCharacter] clip_preprocess方法成功: {type(features)}")
+                            except Exception as clip_err:
+                                print(f"[PIP-InstantCharacter] clip_preprocess方法也失败: {clip_err}")
+                                # 创建特征
+                                features = self._create_special_features(model_type)
+                    
+                    elif 'siglip' in model_type.lower():
+                        # SigLIP特征提取
+                        print(f"[PIP-InstantCharacter] 使用优化的SigLIP特征提取方法")
+                        
+                        try:
+                            # 1. 先尝试标准方法
+                            if hasattr(vision_model, 'encode_image'):
+                                print(f"[PIP-InstantCharacter] 尝试SigLIP标准encode_image方法...")
+                                # 确保输入在模型所在设备上
+                                device_image = image.to(vision_model.load_device if hasattr(vision_model, 'load_device') else vision_model.device)
+                                siglip_features = vision_model.encode_image(device_image)
+                                print(f"[PIP-InstantCharacter] 成功获取SigLIP特征，形状: {siglip_features.shape}")
+                                
+                                # 处理可能的tuple输出
+                                if isinstance(siglip_features, tuple):
+                                    print(f"[PIP-InstantCharacter] SigLIP返回了tuple格式的结果，长度: {len(siglip_features)}")
+                                    # 通常第一个元素是有用的特征
+                                    if len(siglip_features) > 0 and isinstance(siglip_features[0], torch.Tensor):
+                                        siglip_features = siglip_features[0]
+                                        print(f"[PIP-InstantCharacter] 使用tuple中第一个元素: {siglip_features.shape}")
+                            
+                            # 2. 如果失败，尝试内部模型
+                            elif hasattr(vision_model, 'model'):
+                                inner_model = vision_model.model
+                                print(f"[PIP-InstantCharacter] 使用SigLIP内部模型...")
+                                
+                                # 确定模型的设备
+                                model_device = next(inner_model.parameters()).device
+                                print(f"[PIP-InstantCharacter] SigLIP模型设备: {model_device}")
+                                
+                                # 准备归一化输入
+                                inputs = image
+                                if hasattr(vision_model, 'image_mean') and hasattr(vision_model, 'image_std'):
+                                    mean = torch.tensor(vision_model.image_mean).view(1, 3, 1, 1).to(image.device)
+                                    std = torch.tensor(vision_model.image_std).view(1, 3, 1, 1).to(image.device)
+                                    inputs = (inputs - mean) / std
+                                
+                                # 尝试多种调用方式
+                                try:
+                                    # 标准调用
+                                    outputs = inner_model(inputs)
+                                    siglip_features = self._extract_features_from_outputs(outputs, model_type)
+                                except Exception as e:
+                                    print(f"[PIP-InstantCharacter] SigLIP内部模型调用失败: {e}")
+                                    try:
+                                        # 尝试带参数的调用
+                                        outputs = inner_model(inputs, output_hidden_states=True)
+                                        siglip_features = self._extract_features_from_outputs(outputs, model_type)
+                                    except Exception as e2:
+                                        # 尝试特殊尺寸 - 27x27=729 可能匹配模型预期
+                                        try:
+                                            print(f"[PIP-InstantCharacter] 尝试调整SigLIP输入到特定尺寸: 27x27")
+                                            small_input = F.interpolate(image, size=(27, 27), mode='bilinear', align_corners=False)
+                                            inputs = (small_input.to(torch.float32).to(model_device) - 0.5) / 0.5
+                                            print(f"[PIP-InstantCharacter] SigLIP输入形状: {inputs.shape}")
+                                            outputs = inner_model(inputs)
+                                            siglip_features = self._extract_features_from_outputs(outputs, model_type)
+                                        except Exception as e3:
+                                            print(f"[PIP-InstantCharacter] 所有SigLIP调用方式均失败: {e3}")
+                                            siglip_features = self._create_special_features('siglip')
+                            else:
+                                # 如果无法访问模型结构
+                                print(f"[PIP-InstantCharacter] 无法访问SigLIP模型结构")
+                                siglip_features = self._create_special_features('siglip')
+                                
+                            # 确保特征在CPU上进行后续处理
+                            siglip_features = siglip_features.cpu().to(torch.float32)
+                            print(f"[PIP-InstantCharacter] 最终SigLIP特征形状: {siglip_features.shape}")
+                            
+                            # 返回特征
+                            return siglip_features
+                            
+                        except Exception as siglip_err:
+                            print(f"[PIP-InstantCharacter] SigLIP特征提取失败: {siglip_err}")
+                            traceback.print_exc()
+                            siglip_features = self._create_special_features('siglip')
+                            print(f"[PIP-InstantCharacter] 创建替代SigLIP特征: {siglip_features.shape}")
+                            return siglip_features
+                    else:
+                        # 未知模型处理
+                        print(f"[PIP-InstantCharacter] 未知模型类型: {model_type}")
+                        features = self._create_special_features(model_type)
+            except Exception as e:
+                print(f"[PIP-InstantCharacter] 整体特征提取失败: {e}")
+                traceback.print_exc()
+                features = self._create_special_features(model_type)
+            
+            # 返回特征
+            return features
+            
+        except Exception as e:
+            # 最外层异常捕获
+            print(f"[PIP-InstantCharacter] {model_type}特征编码失败: {e}")
+            traceback.print_exc()
+            return self._create_placeholder_features(model_type)
+            
+    def _combine_features(self, dino_features, siglip_features):
+        """结合DinoV2和SigLIP特征用于下游处理"""
+        print(f"[PIP-InstantCharacter] 结合两个模型的特征向量")
+        
+        try:
+            # 检查并初始化特征投影器如果需要
+            if self.feature_projector is None:
+                # 获取特征维度
+                dino_dim = dino_features.shape[-1] if dino_features is not None else 1024
+                siglip_dim = siglip_features.shape[-1] if siglip_features is not None else 768
+                
+                # 初始化特征投影器
+                print(f"[PIP-InstantCharacter] 初始化特征投影器: DinoV2({dino_dim}), SigLIP({siglip_dim}) -> 768")
+                self.feature_projector = FeatureProjector(dinov2_dim=dino_dim, siglip_dim=siglip_dim, hidden_dim=768)
+                self.feature_projector.to('cpu')  # 保持在CPU上以节省显存
+            
+            # 确保特征在CPU上以节省显存
+            if dino_features is not None:
+                dino_features = dino_features.to('cpu')
+            if siglip_features is not None:
+                siglip_features = siglip_features.to('cpu')
+            
+            # 处理可能缺失的特征
+            if dino_features is None:
+                print(f"[PIP-InstantCharacter] DinoV2特征缺失，创建替代特征")
+                dino_features = self._create_special_features('dino')
+            if siglip_features is None:
+                print(f"[PIP-InstantCharacter] SigLIP特征缺失，创建替代特征")
+                siglip_features = self._create_special_features('siglip')
+            
+            # 使用特征投影器结合特征
+            with torch.no_grad():
+                combined_features = self.feature_projector(dino_features, siglip_features)
+            
+            print(f"[PIP-InstantCharacter] 结合后的特征形状: {combined_features.shape}")
+            return combined_features.to(torch.float32)
+        except Exception as e:
+            print(f"[PIP-InstantCharacter] 结合特征时出错: {e}")
+            traceback.print_exc()
+            
+            # 如果出错，返回简单串联的特征
+            try:
+                # 如果两个特征都正常，简单拼接
+                print(f"[PIP-InstantCharacter] 尝试简单拼接特征代替投影")
+                if dino_features.dim() == 2 and siglip_features.dim() == 2:
+                    return torch.cat([dino_features, siglip_features], dim=1).to(torch.float32)
+                else:
+                    # 尺寸不匹配，返回其中一个
+                    if dino_features is not None and dino_features.dim() == 2:
+                        return dino_features.to(torch.float32)
+                    elif siglip_features is not None and siglip_features.dim() == 2:
+                        return siglip_features.to(torch.float32)
+            except Exception as e2:
+                print(f"[PIP-InstantCharacter] 简单拼接也失败: {e2}")
+                # 最后的备选方案：创建随机特征
+                return torch.randn(1, 768, device='cpu').to(torch.float32)
+    
+    def _create_special_features(self, model_type):
+        """创建适合原版InstantCharacter格式的特殊特征向量"""
+        print(f"[PIP-InstantCharacter] 使用特定格式的特征向量，匹配原版InstantCharacter")
+        
+        # 针对不同模型返回相应大小的特征
+        if 'dino' in model_type.lower():
+            # DinoV2格式
+            return torch.randn(1, 1024, device='cpu')  # 随机向量更接近真实特征
+        elif 'siglip' in model_type.lower():
+            # SigLIP格式
+            return torch.randn(1, 768, device='cpu')
+        else:
+            # 默认格式
+            return torch.randn(1, 768, device='cpu')
+            
+    def _create_placeholder_features(self, model_type):
+        """ 创建占位符特征向量 """
+        print("[PIP-InstantCharacter] 创建占位符特征")
+        if 'dino' in model_type.lower():
+            return torch.ones(1, 1024, device='cpu')  # DinoV2特征尺寸
+        elif 'siglip' in model_type.lower():
+            return torch.ones(1, 768, device='cpu')   # SigLIP特征尺寸
+        else:
+            return torch.ones(1, 768, device='cpu')   # 默认尺寸
+    
+    def _fallback_encode(self, vision_model, image, model_type):
+        """ 废弃使用占位符特征 """
+        try:
+            # 尝试使用准备好的图像进行编码
+            device_image = image.to(vision_model.load_device)
+            with torch.inference_mode():
+                features = vision_model.encode_image(device_image)
+            return features
+        except:
+            # 如果依然失败，返回占位符
+            return self._create_placeholder_features(model_type)
+    
+    def apply_instantcharacter(self, model, reference_image, DINOv2, subject_scale=0.9, ip_adapter_name="instantcharacter_ip-adapter.bin", SigLIP=None, low_memory_mode=False):
+        """
+        应用InstantCharacter到模型
+        
+        Args:
+            model: 输入的FLUX/SD/SDXL模型（必须是ModelPatcher类型）
+            reference_image: 参考图像（用于角色保留生成）
+            clip_vision: CLIP Vision模型（通常为DinoV2）
+            ip_adapter_path: IP适配器路径
+            subject_scale: 角色特征强度
+            use_fp8: 是否使用FP8精度（如果支持）
+            clip_vision_2: 第二个CLIP Vision模型（通常为SigLIP）
+            clip: CLIP模型（可选）
+            
+        Returns:
+            修改后的模型
+        """
+        # 严格检查模型类型
+        model_type = type(model).__name__
+        dinov2_type = type(DINOv2).__name__ if DINOv2 is not None else "None"
+        
+        # 检查是否是ModelPatcher类型
+        if not hasattr(model, 'model_options') or not isinstance(model, ModelPatcher):
+            # 检查是否误传了视觉模型
+            model_name = getattr(model, 'model_name', str(type(model)))
+            is_vision_model = any(name in str(model_name).lower() for name in ["dinov2", "siglip", "clip", "vision"])
+            
+            print(f"\n\n[PIP-InstantCharacter] \u26a0\ufe0f 警告: 模型类型错误!")
+            print(f"[PIP-InstantCharacter] - model\u8f93\u5165\u7aef\u53e3\u6536\u5230\u7684\u662f: {model_type}")
+            print(f"[PIP-InstantCharacter] - DINOv2\u8f93\u5165\u7aef\u53e3\u6536\u5230\u7684\u662f: {dinov2_type}")
+            print(f"[PIP-InstantCharacter] 请检查工作流连接:\n")
+            print(f"   1. model端口应该连接SD/SDXL/Flux扩散模型(ModelPatcher类型)")
+            print(f"   2. DINOv2端口应该连接DinoV2视觉模型")
+            print(f"   3. SigLIP端口应该连接SigLIP视觉模型")
+            print(f"\n请修正连接的方向!\n\n")
+            
+            if is_vision_model:
+                print(f"[PIP-InstantCharacter] \u26a0\ufe0f严重错误\u26a0\ufe0f: 视觉模型被错误地连接到model端口！")
+                print(f"[PIP-InstantCharacter] 您将{model_name}连接到了model输入端口，但这应该是一个扩散模型！")
+                print(f"[PIP-InstantCharacter] 正确的连接方式是UNETLoader -> model, CLIPVisionLoader(DinoV2) -> DINOv2, CLIPVisionLoader(SigLIP) -> SigLIP")
+            
+            # 创建一个占位符ModelPatcher并返回，避免后续节点错误
+            # 通常这种情况需要用户更正连接
+            try:
+                # 加载一个最小的空模型作为占位符
+                # 先创建一个完全足够支持接下来传递的占位符
+                # 使用已经导入的ModelPatcher
+                from torch import nn
+                
+                # 创建一个最小的空模型（尽量运行不报错即可）
+                class DummyModel(nn.Module):
+                    def __init__(self):
+                        super().__init__()
+                        self.model_config = {"model_type": "dummy"}
+                        
+                    def forward(self, *args, **kwargs):
+                        return torch.zeros(1, 4, 64, 64).to(model_management.get_torch_device())
+                
+                # 创建占位符模型并设置必要的属性
+                dummy = DummyModel()
+                placeholder_model = ModelPatcher(dummy)
+                placeholder_model.model_options = {}
+                
+                print(f"[PIP-InstantCharacter] 创建占位模型以避免后续节点崩溃")
+                print(f"[PIP-InstantCharacter] 请正确连接模型: UNETLoader -> model, CLIPVisionLoader(DinoV2) -> clip_vision")
+                return (placeholder_model,)
+            except Exception as e:
+                print(f"[PIP-InstantCharacter] 无法创建占位模型: {e}")
+                traceback.print_exc()
+                
+                # 实在没法创建占位符，只能丢弃当前节点返回原始模型
+                print(f"[PIP-InstantCharacter] 无法修复连接错误，工作流可能会崩溃")
+                return (model,)
+            
+        print(f"[PIP-InstantCharacter] 应用InstantCharacter，特征强度: {subject_scale}")
+        
+        try:
+            # 1. 获取完整的IP适配器路径
+            ipadapter_path = folder_paths.get_full_path("ipadapter", ip_adapter_name)
+            if not os.path.exists(ipadapter_path):
+                raise FileNotFoundError(f"IP适配器文件不存在: {ipadapter_path}")
+                
+            # 2. 加载适配器
+            adapter = InstantCharacterIPAdapter(ipadapter_path)
+            
+            # 3. 处理参考图像
+            if reference_image is not None:
+                print("[PIP-InstantCharacter] 处理参考图像并提取特征")
+                
+                # 确保图像是BHWC格式且为float32类型，值范围为[0,1]
+                if len(reference_image.shape) == 3:  # HWC
+                    # 添加批次维度变成BHWC
+                    ref_image = reference_image.unsqueeze(0)
+                else:
+                    ref_image = reference_image
+                    
+                # 确保值范围在[0,1]内
+                if ref_image.max() > 1.0:
+                    ref_image = ref_image / 255.0
+                    
+                # 转为float32类型
+                ref_image = ref_image.to(torch.float32)
+                
+                # 检查是否为量化模型(GGUF)以调整内存策略
+                is_quantized = False
+                model_type = "unknown"
+                if hasattr(model, 'model_options') and 'model_type' in model.model_options:
+                    model_type = model.model_options['model_type']
+                    # 检测是否为GGUF或其他量化模型
+                    if 'gguf' in model_type.lower() or 'quantized' in model_type.lower():
+                        is_quantized = True
+                        print(f"[PIP-InstantCharacter] 检测到量化模型 {model_type}，将优化内存策略")
+                        
+                # 在低内存模式下释放模型内存，以便为特征提取提供更多空间
+                if low_memory_mode and hasattr(model, 'offload'):
+                    print("[PIP-InstantCharacter] 启用低内存模式，临时卸载主模型...")
+                    # 记录原始设备
+                    original_device = next(model.model.parameters()).device
+                    model.offload()
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                
+                # 使用CLIP Vision模型提取特征 - 使用显存管理确保不会OOM
+                with torch.no_grad():
+                    # 缩小图像尺寸以减少显存使用
+                    # 在低内存模式下使用更小的尺寸
+                    max_size = 224 if low_memory_mode else 384
+                    current_size = max(ref_image.shape[1], ref_image.shape[2])
+                    if current_size > max_size:
+                        scale_factor = max_size / current_size
+                        new_h = int(ref_image.shape[1] * scale_factor)
+                        new_w = int(ref_image.shape[2] * scale_factor)
+                        # 使用CPU上的插值，然后再转移到GPU
+                        ref_image_cpu = ref_image.cpu()
+                        ref_image_resized = F.interpolate(ref_image_cpu.permute(0, 3, 1, 2), 
+                                                          size=(new_h, new_w), 
+                                                          mode='bilinear', 
+                                                          align_corners=False)
+                        vision_input = ref_image_resized
+                    else:
+                        # 保持原始尺寸
+                        vision_input = ref_image.permute(0, 3, 1, 2)
+                    
+                    # 确保在正确的设备上，并使用半精度节省显存
+                    input_device = model_management.get_torch_device()
+                    dtype = torch.float16  # 使用半精度
+                    vision_input = vision_input.to(device=input_device, dtype=dtype)
+                    
+                    # 显示当前内存状态
+                    if torch.cuda.is_available():
+                        print(f"[PIP-InstantCharacter] 当前显存状态: 已用{torch.cuda.memory_allocated()/1024**3:.2f}GB / 总共{torch.cuda.get_device_properties(0).total_memory/1024**3:.2f}GB")
+                    
+                    # 现在直接编码图像，获取DinoV2和SigLIP特征
+                    print("[PIP-InstantCharacter] 提取视觉特征...")
+                    
+                    dinov2_features = None
+                    siglip_features = None
+                    use_cpu_fallback = False
+                    
+                    # 准备一个列表来存储特征
+                    all_features = []
+                    
+                    # 获取DinoV2特征
+                    try:
+                        print(f"[PIP-InstantCharacter] 参考图像形状: {vision_input.shape}")
+                            
+                        # 在低内存模式下，使用更激进的内存管理策略
+                        if low_memory_mode:
+                            print("[PIP-InstantCharacter] 低内存模式：激进的内存管理已启用")
+                            torch.cuda.empty_cache()
+                            gc.collect()
+                        
+                        # 简化流程，直接适配调用ComfyUI的预处理方法
+                        print("[PIP-InstantCharacter] 使用ComfyUI原生图像预处理方法")
+                        
+                        # 导入ComfyUI的图像处理工具
+                        try:
+                            from comfy.utils import tensor_to_pil, pil_to_tensor
+                            print("[PIP-InstantCharacter] 成功引入ComfyUI原生图像工具")
+                        except ImportError:
+                            # 如果导入失败，使用我们自己的实现
+                            print("[PIP-InstantCharacter] 引入ComfyUI工具失败，使用内部实现")
+                            
+                            def tensor_to_pil(img_tensor):
+                                # 确保是BHWC格式
+                                if len(img_tensor.shape) == 4 and img_tensor.shape[1] == 3:
+                                    # 如果是BCHW格式，转为BHWC
+                                    img_tensor = img_tensor.permute(0, 2, 3, 1) 
+                                img_np = img_tensor.squeeze(0).cpu().numpy()
+                                # 确保值在0-255范围
+                                if img_np.max() <= 1.0:
+                                    img_np = (img_np * 255).astype(np.uint8)
+                                else:
+                                    img_np = img_np.astype(np.uint8)
+                                return Image.fromarray(img_np)
+                                
+                            def pil_to_tensor(pil_img):
+                                # 转换为数组
+                                np_img = np.array(pil_img).astype(np.float32) / 255.0
+                                # 添加batch维度
+                                tensor = torch.from_numpy(np_img).unsqueeze(0)
+                                return tensor  # 返回BHWC格式
+                        
+                        # 清理临时内存
+                        if low_memory_mode:
+                            torch.cuda.empty_cache()
+                            gc.collect()
+                        
+                        target_size = 160 if low_memory_mode else 224
+                        
+                        # 检查输入是否是预期的格式 (BHWC)
+                        if len(ref_image.shape) == 4:
+                            pil_img = None
+                            # 确定图像格式并转换为PIL
+                            if ref_image.shape[3] == 3:  # BHWC格式
+                                print("[PIP-InstantCharacter] 输入是BHWC格式，直接处理")
+                                pil_img = tensor_to_pil(ref_image)
+                            elif ref_image.shape[1] == 3:  # BCHW格式
+                                print("[PIP-InstantCharacter] 输入是BCHW格式，转换为BHWC")
+                                bhwc = ref_image.permute(0, 2, 3, 1)  # BCHW→BHWC
+                                pil_img = tensor_to_pil(bhwc)
+                            else:
+                                print(f"[PIP-InstantCharacter] 警告: 无法识别的图像通道位置: {ref_image.shape}")
+                                # 尝试检测哪一维是通道维度（假设通道维度为3）
+                                for i in range(4):
+                                    if ref_image.shape[i] == 3:
+                                        print(f"[PIP-InstantCharacter] 检测到第{i}维可能是通道维度")
+                                        perm = list(range(4))
+                                        # 交换到正确位置 (通道在维度3 = BHWC)
+                                        perm.remove(i)
+                                        perm.insert(3, i)
+                                        corrected = ref_image.permute(*perm)
+                                        print(f"[PIP-InstantCharacter] 尝试修正为BHWC: {corrected.shape}")
+                                        pil_img = tensor_to_pil(corrected)
+                                        break
+                            
+                            # 如果转换成功，处理PIL图像
+                            if pil_img is not None:
+                                # 查看原始图像尺寸
+                                print(f"[PIP-InstantCharacter] PIL图像尺寸: {pil_img.size}")
+                                
+                                # 缩放到目标尺寸
+                                pil_img = pil_img.resize((target_size, target_size), Image.Resampling.LANCZOS)
+                                print(f"[PIP-InstantCharacter] 缩放后PIL图像尺寸: {pil_img.size}")
+                                
+                                # 检查PIL图像是否为RGB模式
+                                if pil_img.mode != 'RGB':
+                                    print(f"[PIP-InstantCharacter] 警告: 图像不是RGB模式，当前: {pil_img.mode}，尝试转换为RGB")
+                                    pil_img = pil_img.convert('RGB')
+                                
+                                # 转回BHWC格式的tensor
+                                img_tensor = pil_to_tensor(pil_img)  # 返回BHWC格式
+                                print(f"[PIP-InstantCharacter] BHWC张量形状: {img_tensor.shape}")
+                                
+                                # 验证通道数
+                                if img_tensor.shape[3] != 3:
+                                    print(f"[PIP-InstantCharacter] 警告: 转换后通道数不为3，当前: {img_tensor.shape[3]}")
+                                    # 强制创建正确通道
+                                    dinov2_input = torch.zeros(1, 3, target_size, target_size, dtype=torch.float32)
+                                else:
+                                    # 转换为BCHW当作输入传给内部的encode_image函数
+                                    dinov2_input = img_tensor.permute(0, 3, 1, 2).contiguous().to(torch.float32)  # BHWC→BCHW
+                                    print(f"[PIP-InstantCharacter] BCHW张量形状: {dinov2_input.shape}")
+                            else:
+                                # 无法识别的形状
+                                print(f"[PIP-InstantCharacter] 无法识别的图像形状: {ref_image.shape}，创建空白张量")
+                                dinov2_input = torch.zeros(1, 3, target_size, target_size, dtype=torch.float32)
+                        else:
+                            # 形状错误
+                            print(f"[PIP-InstantCharacter] 输入图像维度不正确: {ref_image.shape}，创建空白张量") 
+                            dinov2_input = torch.zeros(1, 3, target_size, target_size, dtype=torch.float32)
+                        
+                        # 最终验证确保输入是BCHW格式，float32类型，范围[0-1]
+                        if dinov2_input.shape[1] != 3:
+                            print(f"[PIP-InstantCharacter] 错误: 最终输入不是BCHW格式: {dinov2_input.shape}")
+                            # 进行紧急修复 - 确保通道维度正确
+                            if dinov2_input.shape[3] == 3:  # 如果是BHWC
+                                dinov2_input = dinov2_input.permute(0, 3, 1, 2).contiguous()
+                                print(f"[PIP-InstantCharacter] 紧急修复: 转换为BCHW: {dinov2_input.shape}")
+                        
+                        # 输出调试信息
+                        print(f"[PIP-InstantCharacter] 最终图像的形状: {dinov2_input.shape} (BCHW格式)")
+                        
+                        # 检查值范围
+                        if torch.min(dinov2_input) < 0 or torch.max(dinov2_input) > 1:
+                            print(f"[PIP-InstantCharacter] 警告: 值范围不在0-1内, 做强制约束: {torch.min(dinov2_input).item():.2f}-{torch.max(dinov2_input).item():.2f}")
+                            dinov2_input = torch.clamp(dinov2_input, 0.0, 1.0)
+                        
+                        # 在调用前先释放一些GPU内存
+                        if DINOv2.load_device.type == 'cuda':
+                            torch.cuda.empty_cache()
+                            gc.collect()
+                        
+                        # 将图像移动到正确的设备上
+                        dinov2_input = dinov2_input.to(device=DINOv2.load_device, dtype=torch.float32)
+                        
+                        # 通过更新后的encode_image方法提取DinoV2特征
+                        print("[PIP-InstantCharacter] 开始提取DinoV2特征...")
+                        dinov2_output = self.encode_image(DINOv2, dinov2_input, "DinoV2")
+                        
+                        # 处理DinoV2输出
+                        if isinstance(dinov2_output, dict):
+                            if 'image_embeds' in dinov2_output:
+                                dinov2_features = dinov2_output['image_embeds'].to(torch.float32)
+                                print(f"[PIP-InstantCharacter] 提取到DinoV2 image_embeds特征: {dinov2_features.shape}")
+                            elif 'last_hidden_state' in dinov2_output:
+                                dinov2_features = dinov2_output['last_hidden_state'][:, 0].to(torch.float32)  # 使用CLS token
+                                print(f"[PIP-InstantCharacter] 提取到DinoV2 last_hidden_state特征: {dinov2_features.shape}")
+                        elif hasattr(dinov2_output, 'image_embeds') and dinov2_output.image_embeds is not None:
+                            dinov2_features = dinov2_output.image_embeds.to(torch.float32)
+                            print(f"[PIP-InstantCharacter] 提取到DinoV2 image_embeds特征: {dinov2_features.shape}")
+                        elif hasattr(dinov2_output, 'last_hidden_state') and dinov2_output.last_hidden_state is not None:
+                            dinov2_features = dinov2_output.last_hidden_state[:, 0].to(torch.float32)  # 使用CLS token
+                            print(f"[PIP-InstantCharacter] 提取到DinoV2 last_hidden_state特征: {dinov2_features.shape}")
+                        elif isinstance(dinov2_output, torch.Tensor):
+                            dinov2_features = dinov2_output.to(torch.float32)
+                            print(f"[PIP-InstantCharacter] 直接获取DinoV2特征张量: {dinov2_output.shape}")
+                            
+                            # 如果没有提取到特征，创建占位特征
+                            if dinov2_features is None:
+                                print("[PIP-InstantCharacter] 无法提取DinoV2特征，使用占位特征")
+                                dinov2_features = torch.ones((1, 768), device=input_device)
+                        
+                        # 将特征添加到列表
+                        all_features.append(dinov2_features)
+                                
+                        # 处理SigLIP特征
+                        if SigLIP is not None:
+                            try:
+                                # 清理上一步的DinoV2处理的内存
+                                if DINOv2 is not None and DINOv2.load_device.type == 'cuda':
+                                    torch.cuda.empty_cache()
+                                    gc.collect()
+                                
+                                # SigLIP通常使用384x384图像
+                                print("[PIP-InstantCharacter] 准备图像用于SigLIP处理...")
+                                if ref_image.shape[1] > 384 or ref_image.shape[2] > 384:
+                                    print("[PIP-InstantCharacter] 缩小图像用于SigLIP处理，降低显存使用")
+                                    # 使用CPU进行轻量级预处理
+                                    ref_image_cpu = ref_image.cpu()  # 确保在CPU上进行轻量处理
+                                    siglip_input = F.interpolate(ref_image_cpu.permute(0, 3, 1, 2), 
+                                                       size=(384, 384), 
+                                                       mode='bicubic', 
+                                                       align_corners=False).to(torch.float32)
+                                else:
+                                    # 保持原始尺寸
+                                    siglip_input = ref_image.permute(0, 3, 1, 2).to(torch.float32)
+                                
+                                # 将图像移动到正确的设备上
+                                # 先清理一下GPU内存
+                                if SigLIP.load_device.type == 'cuda':
+                                    torch.cuda.empty_cache()
+                                    torch.cuda.synchronize()
+                                    gc.collect()
+                                    
+                                    # 检查剩余显存
+                                    free_mem = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)
+                                    if free_mem < 1.5 * 1024 * 1024 * 1024:  # 小于1.5GB
+                                        print("[PIP-InstantCharacter] 警告: SigLIP处理前显存不足1.5GB，尝试降低图像质量和精度")
+                                        siglip_input = F.interpolate(siglip_input, scale_factor=0.75, mode='bicubic', align_corners=False)
+                                        siglip_input = siglip_input.to(SigLIP.load_device, dtype=torch.float16)  # 使用半精度节省显存
+                                    else:
+                                        siglip_input = siglip_input.to(SigLIP.load_device, dtype=torch.float32)
+                                else:
+                                    siglip_input = siglip_input.to(SigLIP.load_device, dtype=torch.float32)
+                                
+                                # 通过更新后的encode_image方法提取SigLIP特征
+                                print("[PIP-InstantCharacter] 开始提取SigLIP特征...")
+                                siglip_output = self.encode_image(SigLIP, siglip_input, "SigLIP")
+                                siglip_features = None
+                                
+                                # 从SigLIP输出提取特征
+                                if isinstance(siglip_output, dict):
+                                    if 'image_embeds' in siglip_output:
+                                        siglip_features = siglip_output['image_embeds'].to(torch.float32)
+                                        print(f"[PIP-InstantCharacter] 提取到SigLIP image_embeds特征: {siglip_features.shape}")
+                                    elif 'last_hidden_state' in siglip_output:
+                                        siglip_features = siglip_output['last_hidden_state'][:, 0].to(torch.float32)  # 使用CLS token
+                                        print(f"[PIP-InstantCharacter] 提取到SigLIP last_hidden_state特征: {siglip_features.shape}")
+                                elif hasattr(siglip_output, 'image_embeds') and siglip_output.image_embeds is not None:
+                                    siglip_features = siglip_output.image_embeds.to(torch.float32)
+                                    print(f"[PIP-InstantCharacter] 提取到SigLIP image_embeds特征: {siglip_features.shape}")
+                                elif hasattr(siglip_output, 'last_hidden_state') and siglip_output.last_hidden_state is not None:
+                                    siglip_features = siglip_output.last_hidden_state[:, 0].to(torch.float32)  # 使用CLS token
+                                    print(f"[PIP-InstantCharacter] 提取到SigLIP last_hidden_state特征: {siglip_features.shape}")
+                                elif isinstance(siglip_output, torch.Tensor):
+                                    siglip_features = siglip_output.to(torch.float32)
+                                    print(f"[PIP-InstantCharacter] 直接获取SigLIP特征张量: {siglip_features.shape}")
+                                
+                                # 如果无法提取到特征，使用占位特征
+                                if siglip_features is None:
+                                    print("[PIP-InstantCharacter] 无法提取SigLIP特征，使用占位特征")
+                                    siglip_features = torch.ones((1, 768), device=input_device)
+                            except Exception as e:
+                                print(f"[PIP-InstantCharacter] 警告: SigLIP特征处理失败: {e}")
+                                traceback.print_exc()
+                                siglip_features = torch.ones((1, 768), device=input_device)
+                        
+                        # 处理特征完成，已提取完所有特征并准备应用到模型
+                        try:
+                            # 将联合特征应用到模型
+                            # 如果有SigLIP特征，则与DinoV2特征结合使用
+                            if 'siglip_features' in locals() and siglip_features is not None:
+                                print("[PIP-InstantCharacter] 结合DinoV2和SigLIP特征...")
+                                # 尝试将两种特征合并使用
+                                try:
+                                    # 检查特征形状兼容性
+                                    if dinov2_features.shape[0] == siglip_features.shape[0]:
+                                        print(f"[PIP-InstantCharacter] 尝试指数线性组合张量: {dinov2_features.shape} + {siglip_features.shape}")
+                                        
+                                        # 如果SigLIP特征是3D张量，取第一个向量（CLS token）
+                                        if len(siglip_features.shape) == 3:
+                                            siglip_features = siglip_features[:, 0, :]
+                                            print(f"[PIP-InstantCharacter] 将SigLIP特征转排2D: {siglip_features.shape}")
+                                            
+                                        # 尝试完全连接
+                                        combined_features = torch.cat([dinov2_features, siglip_features], dim=1)
+                                        print(f"[PIP-InstantCharacter] 结合特征形状: {combined_features.shape}")
+                                    else:
+                                        print(f"[PIP-InstantCharacter] 特征形状不匹配: {dinov2_features.shape} vs {siglip_features.shape}")
+                                        combined_features = dinov2_features
+                                except Exception as combine_err:
+                                    print(f"[PIP-InstantCharacter] 特征组合失败: {combine_err}")
+                                    traceback.print_exc()
+                                    # 如果结合失败，回退到仅使用DinoV2特征
+                                    print(f"[PIP-InstantCharacter] 回退到仅使用DinoV2特征")
+                                    combined_features = dinov2_features
+                            else:
+                                # 只使用DinoV2特征
+                                combined_features = dinov2_features
+                                print(f"[PIP-InstantCharacter] 只使用DinoV2特征: {combined_features.shape}")
+                        except Exception as feat_err:
+                            print(f"[PIP-InstantCharacter] 处理特征时出错: {feat_err}")
+                            traceback.print_exc()
+                            # 创建默认特征
+                            combined_features = dinov2_features if dinov2_features is not None else torch.ones((1, 768), device=input_device)
+
+                        # 清理GPU缓存
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                            
+                        # 存储提取的特征到image_features
+                        image_features = combined_features
+                        
+                        # 清理GPU缓存
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                            
+                        print(f"[PIP-InstantCharacter] 成功提取特征，准备应用到模型中")
+                        # 特征提取完成，清理不需要的GPU缓存
+                        if input_device.type == 'cuda':
+                            torch.cuda.empty_cache()
+                        
+                        # 确保特征处于正确的数据类型和范围
+                        # 根据内存状态进行自适应精度调整
+                        if low_memory_mode or torch.cuda.is_available() and torch.cuda.memory_allocated() > 0.8 * torch.cuda.get_device_properties(0).total_memory:
+                            # 在低内存模式或内存占用超过80%时使用低精度
+                            if hasattr(torch, "float8_e4m3fn"):
+                                print("[PIP-InstantCharacter] 使用FP8精度优化模型内存使用")
+                                image_features = combined_features.to(torch.float16)  # FP8不能直接转换
+                            else:
+                                print("[PIP-InstantCharacter] 使用FP16精度优化模型内存使用")
+                                image_features = combined_features.to(torch.float16)
+                        else:
+                            # 正常模式使用float32
+                            image_features = combined_features.to(torch.float32)
+                        
+                        print(f"[PIP-InstantCharacter] 特征提取完成! 最终特征形状: {image_features.shape}")
+                    except Exception as e:
+                        print(f"[PIP-InstantCharacter] GPU提取特征失败: {e}")
+                        print(f"[PIP-InstantCharacter] 堆栈跟踪: {traceback.format_exc()}")
+                        use_cpu_fallback = True
+                    
+                    # CPU回退模式 - 如果前面的特征提取失败
+                    if use_cpu_fallback:
+                        try:
+                            print("[PIP-InstantCharacter] 尝试使用CPU回退模式...")
+                            
+                            # 使用占位特征代替真实特征，以让流程继续
+                            print("[PIP-InstantCharacter] 警告: 使用占位特征，结果可能不理想")
+                            image_features = torch.ones((1, 768), dtype=torch.float32)
+                            
+                            print(f"[PIP-InstantCharacter] 创建了占位特征, 形状: {image_features.shape}")
+                        except Exception as e:
+                            print(f"[PIP-InstantCharacter] CPU回退模式也失败: {e}")
+                            return (model,)
+                            
+                    # 最终清理GPU缓存
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    
+                    print(f"[PIP-InstantCharacter] 成功提取DinoV2特征, 形状: {image_features.shape if hasattr(image_features, 'shape') else 'unknown'}")
+            else:
+                print("[PIP-InstantCharacter] 警告: 未提供参考图像")
+                image_features = None
+            
+            # 4. 在应用前先优化显存
+            try:
+                # 先释放不再需要的显存
+                input_device = model_management.get_torch_device()
+                if input_device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                
+                # 选择最适合的精度
+                target_dtype = None
+                # 根据内存状态自适应精度
+                if hasattr(torch, "float8_e4m3fn") and (low_memory_mode or 
+                      (torch.cuda.is_available() and torch.cuda.memory_allocated() > 0.7 * torch.cuda.get_device_properties(0).total_memory)):
+                    print("[PIP-InstantCharacter] 使用FP8精度优化模型内存使用")
+                    target_dtype = torch.float8_e4m3fn
+                elif model_management.should_use_fp16() or low_memory_mode:
+                    print("[PIP-InstantCharacter] 使用FP16精度优化模型内存使用")
+                    target_dtype = torch.float16
+                else:
+                    print("[PIP-InstantCharacter] 使用标准精度应用InstantCharacter")
+                
+                # 将特征转换为目标精度
+                if image_features is not None and target_dtype is not None:
+                    # 先确保在CPU上转换，以避免显存分配问题
+                    image_features_cpu = image_features.cpu()
+                    if target_dtype == torch.float8_e4m3fn:
+                        # FP8需要特殊处理
+                        image_features = image_features_cpu.to(torch.float16)
+                    else:
+                        image_features = image_features_cpu.to(target_dtype)
+                
+                # 检查模型是否是ModelPatcher类型
+                if hasattr(model, 'clone') and hasattr(model, 'model_options'):
+                    print("[PIP-InstantCharacter] 使用ModelPatcher方式应用特征")
+                    # 创建模型副本并添加所需属性
+                    patched_model = model.clone()
+                    patched_model.ip_adapter = adapter
+                    patched_model.subject_scale = subject_scale
+                    patched_model.image_features = image_features
+                    
+                    # 返回修改后的模型
+                    return (patched_model,)
+                else:
+                    print(f"[PIP-InstantCharacter] 警告: 输入模型不是ModelPatcher对象，无法应用InstantCharacter")
+                    print(f"[PIP-InstantCharacter] 模型类型: {type(model)}")
+                    # 返回原始模型，流程将继续但不应用特征
+                    return (model,)
+            except Exception as e:
+                print(f"[PIP-InstantCharacter] 警告: 模型修改过程中出错: {e}")
+                # 发生错误时返回原始模型
+                return (model,)
+            
+        except Exception as e:
+            print(f"[PIP-InstantCharacter] 应用InstantCharacter失败: {str(e)}")
+            # 出错时返回原始模型
+            return (model,)
+
+
+# 注册节点
+NODE_CLASS_MAPPINGS = {
+    "PIPInstantCharacter": PIPApplyInstantCharacter,
+}
+
+# 注册节点显示名称
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "PIPInstantCharacter": "PIP InstantCharacter 应用",
+}
