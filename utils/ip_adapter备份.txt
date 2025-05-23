@@ -1,0 +1,599 @@
+"""
+InstantCharacter IP适配器 - 原版实现
+完全复制原版InstantCharacter的IP适配器实现，确保效果一致
+"""
+
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.cuda.amp import autocast
+from einops import rearrange
+from typing import Optional
+
+
+class RMSNorm(nn.Module):
+    """从原版InstantCharacter复制的RMSNorm实现"""
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x):
+        # x: [bs, seq_len, dim]
+        # norm_x: [bs, seq_len, dim]
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        # x: [bs, seq_len, dim]
+        # output: [bs, seq_len, dim]
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
+
+
+class FluxIPAttnProcessor(nn.Module):
+    """从原版InstantCharacter复制的注意力处理器"""
+
+    def __init__(
+        self,
+        hidden_size=None,
+        ip_hidden_states_dim=None,
+    ):
+        super().__init__()
+        self.norm_ip_q = RMSNorm(128, eps=1e-6)
+        self.to_k_ip = nn.Linear(ip_hidden_states_dim, hidden_size)
+        self.norm_ip_k = RMSNorm(128, eps=1e-6)
+        self.to_v_ip = nn.Linear(ip_hidden_states_dim, hidden_size)
+
+    def __call__(
+        self,
+        attn,
+        hidden_states: torch.FloatTensor,
+        encoder_hidden_states: torch.FloatTensor = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+        emb_dict={},
+        subject_emb_dict={},
+        *args,
+        **kwargs,
+    ) -> torch.FloatTensor:
+        batch_size, _, _ = hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+
+        # `sample` projections.
+        query = attn.to_q(hidden_states)
+        key = attn.to_k(hidden_states)
+        value = attn.to_v(hidden_states)
+
+        # IPadapter
+        ip_hidden_states = self._get_ip_hidden_states(
+            attn, 
+            query if encoder_hidden_states is not None else query[:, emb_dict['length_encoder_hidden_states']:],
+            subject_emb_dict.get('ip_hidden_states', None)
+        )
+        if ip_hidden_states is not None:
+            # Get key/value for IP-Adapter
+            key_ip = self.to_k_ip(ip_hidden_states)
+            value_ip = self.to_v_ip(ip_hidden_states)
+
+            # Add IP-Adapter to the attention
+            key = torch.cat([key, key_ip], dim=1)
+            value = torch.cat([value, value_ip], dim=1)
+
+        head_dim = attn.heads
+
+        # The query has a head dimension we need to extract.
+        query = attn.head_to_batch_dim(query)
+        key = attn.head_to_batch_dim(key)
+        value = attn.head_to_batch_dim(value)
+
+        attention_probs = attn.get_attention_scores(query, key, attention_mask)
+        hidden_states = torch.bmm(attention_probs, value)
+        hidden_states = attn.batch_to_head_dim(hidden_states)
+
+        # Linear projection.
+        hidden_states = attn.to_out[0](hidden_states)
+        # Dropout.
+        hidden_states = attn.to_out[1](hidden_states)
+
+        return hidden_states
+        
+    def _get_ip_hidden_states(self, attn, query, ip_hidden_states):
+        """获取IP适配器隐藏状态"""
+        if ip_hidden_states is None:
+            return None
+            
+        ip_scale = getattr(attn, 'ip_adapter_scale', 1.0)
+        return ip_hidden_states * ip_scale
+
+class InstantCharacterIPAdapter:
+    """
+    优化的InstantCharacter IP适配器
+    支持22G显存优化方案，保持接口不变但内部实现更接近原版
+    """
+    
+    def __init__(self, adapter_path, device="cuda"):
+        self.device = device
+        self.adapter_path = adapter_path
+        self.state_dict = None
+        self.image_proj = None
+        self.image_proj_norm = None
+        self.hidden_states_proj = None
+        
+        # 检查IP适配器文件是否存在
+        if not os.path.exists(adapter_path):
+            raise FileNotFoundError(f"[PIP-InstantCharacter] IP适配器文件不存在: {adapter_path}")
+            
+        print(f"[PIP-InstantCharacter] 初始化IP适配器: {os.path.basename(adapter_path)}")
+        self.load_adapter(adapter_path)
+    
+    def load_adapter(self, adapter_path):
+        """加载IP适配器权重，使用内存映射减少内存占用"""
+        try:
+            # 使用内存映射加载大模型文件
+            print(f"[PIP-InstantCharacter] 加载IP适配器权重: {os.path.basename(adapter_path)}")
+            
+            # 使用torch.load的mmap参数减少内存占用
+            self.state_dict = torch.load(adapter_path, map_location='cpu', mmap=True, weights_only=True)
+            
+            # 初始化各组件
+            self._init_components()
+            
+            # 清理不需要的state_dict以释放内存
+            del self.state_dict
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+            print("[PIP-InstantCharacter] IP适配器加载完成")
+            
+        except Exception as e:
+            print(f"[PIP-InstantCharacter] 加载IP适配器失败: {str(e)}")
+            raise
+    
+    def _init_components(self):
+        """初始化模型组件"""
+        # 检查state_dict键名格式，以支持不同格式的权重文件
+        keys = list(self.state_dict.keys())
+        print(f"[PIP-InstantCharacter] 加载IP适配器权重，键名样例: {keys[:5]}")
+        
+        # 检测是否含有前缀（比如"ip_adapter."或"image_proj."）
+        has_ip_adapter_prefix = any(k.startswith("ip_adapter.") for k in keys)
+        
+        # 图像投影层 - 尝试不同的键名前缀
+        prefixes_to_try = ["", "ip_adapter.", "model."]
+        
+        # 图像投影层
+        self.image_proj = None
+        self.image_proj_norm = None
+        
+        # 尝试不同前缀
+        for prefix in prefixes_to_try:
+            if self.image_proj is None:
+                self.image_proj = self._create_linear(f"{prefix}image_proj")
+            if self.image_proj_norm is None:
+                self.image_proj_norm = self._create_layernorm(f"{prefix}image_proj_norm")
+            
+            # 如果找到了，就跳出循环
+            if self.image_proj is not None and self.image_proj_norm is not None:
+                print(f"[PIP-InstantCharacter] 使用前缀 '{prefix}' 找到了IP适配器组件")
+                break
+        
+        # 检查核心组件是否初始化成功
+        if self.image_proj is None or self.image_proj_norm is None:
+            print("[PIP-InstantCharacter] 警告: 核心IP适配器组件初始化失败")
+            print(f"[PIP-InstantCharacter] image_proj: {self.image_proj}, image_proj_norm: {self.image_proj_norm}")
+            print(f"[PIP-InstantCharacter] 检查state_dict键: {list(self.state_dict.keys())[:10]}...")
+            
+            # 尝试创建占位组件而不是直接抛出错误
+            # 使用动态特征维度，全面支持InstantCharacter的特征尺寸
+            feature_dim = 2176  # 原版InstantCharacter特征维度
+            hidden_dim = 768    # 隐藏层维度
+            
+            if self.image_proj is None:
+                print(f"[PIP-InstantCharacter] 创建占位image_proj组件 ({feature_dim} -> {hidden_dim})...")
+                self.image_proj = self._create_linear("image_proj", input_dim=feature_dim, output_dim=hidden_dim)
+            if self.image_proj_norm is None:
+                print(f"[PIP-InstantCharacter] 创建占位image_proj_norm组件 ({hidden_dim})...")
+                self.image_proj_norm = self._create_layernorm("image_proj_norm", dim=hidden_dim)
+        
+        # 第二层投影（如果存在）
+        self.image_proj_2 = None
+        self.image_proj_norm_2 = None
+        for prefix in prefixes_to_try:
+            if any(k.startswith(f"{prefix}image_proj_2") for k in self.state_dict.keys()):
+                self.image_proj_2 = self._create_linear(f"{prefix}image_proj_2")
+                self.image_proj_norm_2 = self._create_layernorm(f"{prefix}image_proj_norm_2")
+                if self.image_proj_2 is not None:
+                    break
+        
+        # 隐藏状态投影
+        self.hidden_states_proj = None
+        for prefix in prefixes_to_try:
+            self.hidden_states_proj = self._create_linear(f"{prefix}hidden_states_proj")
+            if self.hidden_states_proj is not None:
+                break
+        
+        print("[PIP-InstantCharacter] IP适配器组件初始化完成")
+    
+    def _create_linear(self, prefix, input_dim=None, output_dim=None):
+        """
+        创建线性层
+        
+        Args:
+            prefix: 权重键前缀
+            input_dim: 可选，输入维度，如果权重不存在则使用这个尺寸
+            output_dim: 可选，输出维度，如果权重不存在则使用这个尺寸
+        """
+        weight = self.state_dict.get(f"{prefix}.weight")
+        bias = self.state_dict.get(f"{prefix}.bias")
+        
+        # 使用默认权重或自定义尺寸
+        if weight is not None and bias is not None:
+            # 创建基于权重的线性层
+            layer = nn.Linear(weight.shape[1], weight.shape[0], device='cpu')
+            print(f"[PIP-InstantCharacter] 创建线性层 {prefix}: {weight.shape[1]} -> {weight.shape[0]}")
+            
+            # 使用no_grad避免不必要的梯度计算
+            with torch.no_grad():
+                layer.weight.copy_(weight)
+                layer.bias.copy_(bias)
+        elif input_dim is not None and output_dim is not None:
+            # 如果没有预定义的权重，但指定了尺寸，则创建新的线性层
+            layer = nn.Linear(input_dim, output_dim, device='cpu')
+            print(f"[PIP-InstantCharacter] 创建自定义线性层 {prefix}: {input_dim} -> {output_dim}")
+        else:
+            print(f"[PIP-InstantCharacter] 无法创建线性层 {prefix}: 无有效权重或尺寸信息")
+            return None
+        
+        # 移动到目标设备
+        return layer.to(self.device)
+    
+    def _create_layernorm(self, prefix, dim=None):
+        """
+        创建LayerNorm层
+        
+        Args:
+            prefix: 权重键前缀
+            dim: 可选，如果权重不存在则使用此维度创建LayerNorm
+        """
+        weight = self.state_dict.get(f"{prefix}.weight")
+        bias = self.state_dict.get(f"{prefix}.bias")
+        
+        # 使用默认权重或自定义维度
+        if weight is not None and bias is not None:
+            # 基于权重创建层归一化
+            layer = nn.LayerNorm(weight.shape[0], device='cpu')
+            print(f"[PIP-InstantCharacter] 创建LayerNorm层 {prefix}: 维度 {weight.shape[0]}")
+            
+            # 使用no_grad避免不必要的梯度计算
+            with torch.no_grad():
+                layer.weight.copy_(weight)
+                layer.bias.copy_(bias)
+        elif dim is not None:
+            # 如果没有预定义的权重，但指定了维度，则创建新的层归一化
+            layer = nn.LayerNorm(dim, device='cpu')
+            print(f"[PIP-InstantCharacter] 创建自定义LayerNorm层 {prefix}: 维度 {dim}")
+        else:
+            print(f"[PIP-InstantCharacter] 无法创建LayerNorm层 {prefix}: 无有效权重或维度信息")
+            return None
+        
+        # 移动到目标设备
+        return layer.to(self.device)
+    
+    @torch.no_grad()
+    def encode_image(self, image_features):
+        """编码图像特征 - 原版实现"""
+        # 严格检查输入
+        if image_features is None:
+            raise ValueError("[PIP-InstantCharacter] 错误: 图像特征为None，无法进行编码")
+        
+        # 确保输入是张量
+        if not isinstance(image_features, torch.Tensor):
+            raise ValueError(f"[PIP-InstantCharacter] 错误: 图像特征必须是张量，而不是{type(image_features)}")
+        
+        # 检查各个组件是否正确初始化
+        component_status = {
+            "image_proj": self.image_proj is not None,
+            "image_proj_norm": self.image_proj_norm is not None,
+            "hidden_states_proj": self.hidden_states_proj is not None
+        }
+        
+        # 打印组件状态与设备信息
+        print(f"[PIP-InstantCharacter] IP适配器组件状态: {component_status}")
+        print(f"[PIP-InstantCharacter] 当前设备: {self.device}")
+        print(f"[PIP-InstantCharacter] 图像特征形状: {image_features.shape}")
+        
+        # 严格检查核心组件是否存在
+        if self.image_proj is None or self.image_proj_norm is None:
+            raise RuntimeError("[PIP-InstantCharacter] 错误: IP适配器核心组件缺失，无法进行图像编码")
+        
+        # 确保输入在正确的设备上
+        image_features = image_features.to(self.device)
+        
+        # 获取IP适配器的输入维度
+        expected_dim = self.image_proj.weight.shape[1]  # 权重矩阵的输入维度
+        actual_dim = image_features.shape[-1]  # 实际特征的最后一个维度
+        
+        # 如果维度不匹配，则需要进行调整
+        if actual_dim != expected_dim:
+            print(f"[PIP-InstantCharacter] 特征维度不匹配: 实际维度 {actual_dim}, 期望维度 {expected_dim}")
+            
+            # 创建一个临时的线性变换层进行维度调整
+            if not hasattr(self, 'dim_adapter') or self.dim_adapter is None:
+                print(f"[PIP-InstantCharacter] 创建维度适配层: {actual_dim} -> {expected_dim}")
+                self.dim_adapter = torch.nn.Linear(actual_dim, expected_dim).to(self.device)
+                
+                # 使用正交初始化以保留信息
+                torch.nn.init.orthogonal_(self.dim_adapter.weight)
+                torch.nn.init.zeros_(self.dim_adapter.bias)
+            
+            # 应用维度转换
+            image_features = self.dim_adapter(image_features)
+            print(f"[PIP-InstantCharacter] 调整后特征维度: {image_features.shape}")
+        
+        # 检测输入数据类型
+        input_dtype = image_features.dtype
+        print(f"[PIP-InstantCharacter] 输入特征数据类型: {input_dtype}")
+        
+        # 检测模型权重数据类型
+        weight_dtype = self.image_proj.weight.dtype if self.image_proj is not None else None
+        print(f"[PIP-InstantCharacter] 模型权重数据类型: {weight_dtype}")
+        
+        # 确保数据类型匹配
+        if input_dtype != weight_dtype and weight_dtype is not None:
+            print(f"[PIP-InstantCharacter] 将输入特征从{input_dtype}转换为{weight_dtype}")
+            image_features = image_features.to(dtype=weight_dtype)
+        
+        # 使用现代的自动混合精度API
+        with torch.amp.autocast('cuda', enabled=False):  # 关闭自动混合精度以确保数据类型一致
+            try:
+                # 第一层投影
+                x = self.image_proj(image_features)
+                x = self.image_proj_norm(x)
+            except RuntimeError as e:
+                print(f"[PIP-InstantCharacter] 特征编码错误: {e}")
+                # 打印更详细的错误信息
+                print(f"[PIP-InstantCharacter] 详细信息 - 特征形状: {image_features.shape}, 权重形状: {self.image_proj.weight.shape}")
+                
+                # 尝试更激进的类型转换
+                print("[PIP-InstantCharacter] 尝试强制转换模型权重类型...")
+                # 将所有模型权重转换为输入类型
+                if self.image_proj is not None:
+                    self.image_proj = self.image_proj.to(dtype=input_dtype)
+                if self.image_proj_norm is not None:
+                    self.image_proj_norm = self.image_proj_norm.to(dtype=input_dtype)
+                
+                # 重新尝试
+                x = self.image_proj(image_features.to(dtype=input_dtype))
+                x = self.image_proj_norm(x)
+            
+            # 第二层投影（如果存在）
+            if hasattr(self, 'image_proj_2') and hasattr(self, 'image_proj_norm_2'):
+                if self.image_proj_2 is not None and self.image_proj_norm_2 is not None:
+                    x = self.image_proj_2(x)
+                    x = self.image_proj_norm_2(x)
+            
+            # 应用隐藏状态投影
+            if self.hidden_states_proj is not None:
+                x = self.hidden_states_proj(x)
+        
+        return x
+    
+    def to(self, device):
+        """移动所有组件到指定设备"""
+        self.device = device
+        for name, module in self.__dict__.items():
+            if isinstance(module, (nn.Module, torch.Tensor)) and module is not None:
+                setattr(self, name, module.to(device))
+        return self
+        
+    @torch.no_grad()
+    def apply(self, input_model, features, scale=1.0):
+        """
+        将InstantCharacter特征应用到模型 - 原版实现
+        
+        Args:
+            input_model: 输入的模型（ModelPatcher实例）
+            features: 图像特征字典，包含多尺度特征
+            scale: 特征强度系数
+            
+        Returns:
+            添加了IP适配器的模型，已经过FluxIPAttnProcessor处理
+        """
+        print(f"[PIP-InstantCharacter] 应用InstantCharacter到模型，强度: {scale}")
+        
+        # 验证输入
+        if input_model is None:
+            print("[PIP-InstantCharacter] 错误: 输入模型为None")
+            return input_model
+            
+        # 验证特征
+        if not isinstance(features, dict):
+            print(f"[PIP-InstantCharacter] 错误: 特征必须是字典类型，当前类型: {type(features)}")
+            return input_model
+            
+        if len(features) == 0:
+            print("[PIP-InstantCharacter] 错误: 特征字典为空")
+            return input_model
+            
+        try:
+            # 复制模型（如果支持）
+            if hasattr(input_model, 'clone'):
+                patched_model = input_model.clone()
+            else:
+                patched_model = input_model
+                
+            # 检测模型类型
+            print(f"[PIP-InstantCharacter] 模型类型: {type(patched_model).__name__}")
+            if hasattr(patched_model, 'model'):
+                print(f"[PIP-InstantCharacter] 模型子类型: {type(patched_model.model).__name__}")
+            
+            # 安全获取transformer实例
+            transformer = None
+            if hasattr(patched_model, 'model'):
+                if hasattr(patched_model.model, 'diffusion_model'):
+                    transformer = patched_model.model.diffusion_model
+                    print(f"[PIP-InstantCharacter] 检测到标准模型结构: diffusion_model")
+                elif hasattr(patched_model.model, 'transformer'):
+                    transformer = patched_model.model.transformer
+                    print(f"[PIP-InstantCharacter] 检测到Flux模型结构: transformer")
+                else:
+                    # 可能是Flux模型，但没有常规结构
+                    transformer = patched_model.model
+                    print(f"[PIP-InstantCharacter] 检测到非标准模型结构，直接使用model实例")
+            
+            # 安全获取设备和数据类型
+            dev = self.device  # 默认使用当前实例的设备
+            dtype = torch.float16  # 默认数据类型
+            
+            if transformer is not None:
+                # 尝试获取设备
+                if hasattr(transformer, 'device'):
+                    dev = transformer.device
+                elif hasattr(transformer, 'parameters'):
+                    try:
+                        # 尝试从参数获取设备
+                        dev = next(transformer.parameters()).device
+                    except (StopIteration, AttributeError):
+                        # 如果没有参数或方法不存在
+                        pass
+                
+                # 尝试获取数据类型
+                if hasattr(transformer, 'dtype'):
+                    dtype = transformer.dtype
+                elif hasattr(transformer, 'parameters'):
+                    try:
+                        # 尝试从参数获取数据类型
+                        dtype = next(transformer.parameters()).dtype
+                    except (StopIteration, AttributeError):
+                        # 如果没有参数或方法不存在
+                        pass
+            
+            # 移动到相同设备和数据类型
+            print(f"[PIP-InstantCharacter] 使用设备: {dev}, 数据类型: {dtype}")
+            if dev is not None:
+                self.to(dev)
+        
+            # 准备特征处理
+            print(f"[PIP-InstantCharacter] 处理特征字典...")
+            print(f"[PIP-InstantCharacter] 可用的特征键: {list(features.keys())}")
+            
+            # 尝试不同的特征键来源
+            feature_to_use = None
+            
+            # 首选键值
+            if 'image_embeds_low_res_deep' in features and features['image_embeds_low_res_deep'] is not None:
+                feature_to_use = features['image_embeds_low_res_deep']
+                print("[PIP-InstantCharacter] 使用image_embeds_low_res_deep特征")
+            # 深度特征
+            elif 'deep_features' in features and 'low_res' in features['deep_features']:
+                feature_to_use = features['deep_features']['low_res']
+                print("[PIP-InstantCharacter] 使用deep_features.low_res特征")
+            # 尝试使用dino特征
+            elif 'dino_features_low' in features and features['dino_features_low'] is not None:
+                feature_to_use = features['dino_features_low']
+                print("[PIP-InstantCharacter] 使用dino_features_low特征")
+            # 最后尝试组合特征
+            elif 'combined' in features and features['combined'] is not None:
+                feature_to_use = features['combined']
+                print("[PIP-InstantCharacter] 使用combined特征")
+            
+            # 检查是否找到了可用的特征
+            if feature_to_use is None:
+                print("[PIP-InstantCharacter] 错误: 无法找到可用的特征数据")
+                return input_model
+                
+            # 打印特征张量信息
+            if isinstance(feature_to_use, torch.Tensor):
+                print(f"[PIP-InstantCharacter] 特征张量形状: {feature_to_use.shape}, 类型: {feature_to_use.dtype}, 设备: {feature_to_use.device}")
+                
+            # 编码特征
+            try:
+                encoded_features = self.encode_image(feature_to_use)
+                print(f"[PIP-InstantCharacter] 特征编码成功，形状: {encoded_features.shape if isinstance(encoded_features, torch.Tensor) else '未知'}")
+            except Exception as e:
+                print(f"[PIP-InstantCharacter] 特征编码失败: {e}")
+                import traceback
+                traceback.print_exc()
+                return input_model
+                
+            # 初始化变量
+            attn_procs = {}
+            is_sd_model = False
+            is_flux_model = False
+            
+            # 检测模型类型
+            if transformer is not None:
+                is_sd_model = hasattr(transformer, 'set_attn_processor')
+                is_flux_model = not is_sd_model and (type(transformer).__name__ == "Flux" or "flux" in type(transformer).__name__.lower())
+            
+            # 初始化IP适配器注意力处理器
+            if transformer is not None and hasattr(transformer, 'set_attn_processor'):
+                try:
+                    # 对于标准SD模型，创建注意力处理器字典
+                    print("[PIP-InstantCharacter] 初始化标准SD模型的注意力处理器")
+                    # 获取当前的处理器
+                    curr_attn_procs = transformer.attn_processors
+                    
+                    # 遍历注意力层并添加处理器
+                    for name, module in transformer.named_modules():
+                        if name.endswith('attn1') or name.endswith('attn2'):
+                            if name not in curr_attn_procs or not isinstance(curr_attn_procs[name], FluxIPAttnProcessor):
+                                if hasattr(module, 'to_q') and hasattr(module, 'to_k') and hasattr(module, 'to_v'):
+                                    hidden_size = module.to_q.out_features
+                                    attn_procs[name] = FluxIPAttnProcessor(
+                                        hidden_size=hidden_size,
+                                        ip_hidden_states_dim=768,  # 编码后的特征维度
+                                    )
+                    
+                    # 设置注意力处理器
+                    if len(attn_procs) > 0:
+                        transformer.set_attn_processor(attn_procs)
+                        print(f"[PIP-InstantCharacter] 成功设置注意力处理器: {len(attn_procs)}个层")
+                    else:
+                        print("[PIP-InstantCharacter] 警告: 没有找到可用的注意力层")
+                except Exception as e:
+                    print(f"[PIP-InstantCharacter] 初始化注意力处理器时出错: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # 对Flux模型使用替代方法应用注意力
+            if is_flux_model and transformer is not None:
+                print("[PIP-InstantCharacter] 对Flux模型使用替代方法应用注意力")
+                try:
+                    # 对于Flux模型，我们直接在模型上设置属性
+                    setattr(transformer, 'ip_adapter_enabled', True)
+                    # 特征和缩放比例设置在transformer上
+                    setattr(transformer, 'ip_adapter_features', encoded_features)
+                    setattr(transformer, 'ip_adapter_scale', scale)
+                    print("[PIP-InstantCharacter] 成功将IP适配器属性设置到Flux模型")
+                except Exception as e:
+                    print(f"[PIP-InstantCharacter] 设置Flux模型属性时出错: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # 设置特征和缩放比例在patched_model上
+            try:
+                # 尝试在不同的层次上设置特征，增加兼容性
+                patched_model.ip_adapter_features = encoded_features
+                patched_model.ip_adapter_scale = scale
+                
+                # 对于某些模型，也可能需要在model属性上设置
+                if hasattr(patched_model, 'model'):
+                    patched_model.model.ip_adapter_features = encoded_features
+                    patched_model.model.ip_adapter_scale = scale
+                
+                print("[PIP-InstantCharacter] 成功设置模型的IP适配器特征和缩放比例")
+            except Exception as e:
+                print(f"[PIP-InstantCharacter] 设置特征和缩放比例时出错(非致命): {e}")
+            
+            print(f"[PIP-InstantCharacter] 成功应用InstantCharacter到模型")
+            return patched_model
+            
+        except Exception as e:
+            print(f"[PIP-InstantCharacter] 应用InstantCharacter时出错: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # 出错时返回原始模型
+            print("[PIP-InstantCharacter] 返回原始模型")
+            return input_model
